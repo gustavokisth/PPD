@@ -112,6 +112,11 @@
 int posImg = 0;
 int *limInferior, *limSuperior;
 #endif
+#if defined(_MPI)
+#include <mpi.h>
+int posImg = 0;
+int *limInferior, *limSuperior;
+#endif
 
 #include <exemplo_num_threads.h>
 int numThreads;
@@ -167,13 +172,13 @@ void imgFunc() {
   #endif
 
 #if defined(_OPENMP)
-  omp_set_dynamic(0); //disabilita criação dinâmica de threads, ou seja, mantém o valor estipulado em num_threads
+  omp_set_dynamic(0); //desabilita criação dinâmica de threads, ou seja, mantém o valor estipulado em num_threads
   #pragma omp parallel for simd num_threads(numThreads) //omp paralelo para loop for em SIMD
 #endif
 
-#if !defined(_PTHREAD)
+#if !defined(_PTHREAD) && !defined(_MPI)
     for(int x=0; x<nImagens; x++) {
-#else // se é pthread, tem que pegar valor para x
+#else // se é pthread ou MPI, tem que pegar valor para x
         int x = posImg;
 #endif
     uint8_t   image_data[CONV1_IM_CH * CONV1_IM_DIM * CONV1_IM_DIM] = {0};
@@ -240,7 +245,7 @@ void imgFunc() {
         printf("%d= %d: %d\n", x, j, output_data[j]);
     }
     printf("\n");//*/
-#if !defined(_PTHREAD)
+#if !defined(_PTHREAD) && !defined(_MPI)
     }
 #endif
 }
@@ -257,19 +262,120 @@ void imgFunc() {
     }
 #endif
 
+#if defined(_MPI)
+    void func_mpi(int limInferior, int limSuperior) {
+        for (int i=limInferior; i<=limSuperior; i++) {
+            posImg = i;
+            imgFunc();
+        }
+    }
+#endif
+
+
 int main(int argc, char *argv[]) {
+#if defined(_MPI) //MPI
+    int threadAtual;
+    
+    MPI_Init_thread(NULL, NULL, MPI_THREAD_MULTIPLE, NULL);
+    MPI_Comm_size(MPI_COMM_WORLD, &numThreads);
+    MPI_Comm_rank(MPI_COMM_WORLD, &threadAtual);
+
+    if (threadAtual == 0) { //primeira thread a ser gerada
+        printf("Executando a CNN para %d imagens ", nImagens);
+        clock_gettime(CLOCK_REALTIME, &start); //tempo de início da execução do programa
+        printf("com MPI em %d threads\n", numThreads);
+
+        limInferior = (int *) calloc(numThreads, sizeof(int)); //aloca um vetor na memória de acordo com o número de threads
+        limSuperior = (int *) calloc(numThreads, sizeof(int)); //aloca um vetor na memória de acordo com o número de threads
+        int total = nImagens, nThreads = numThreads;
+
+        for (int i=0; i<numThreads; i++) { //para dividir carga de trabalho entre as threads a serem criadas
+            float divide = (float) total / (float) nThreads; //divide o número de imagens pelo número de threads
+            int arredonda = ceil(divide); //arredonda pra cima para não perder nenhuma imagem
+            total -= arredonda; //desconta o valor do total de imagens que resta serem analisadas
+            nThreads--; //desconta do valor de threads que precisam de uma carga de trabalho
+            if (i == 0) { //para a primeira thread, o limite inferior sempre é 0 e o limite superior é a carga de trabalho da thread -1
+                limInferior[i] = 0;
+                limSuperior[i] = arredonda - 1;
+                
+                func_mpi(limInferior[i], limSuperior[i]);
+            }
+            else { //para as demais threads, o limite inferior é o limite superior da thread anterior +1 e o limite superior é o limite superior da thread anterior adicionada da carga de trabalho
+                limInferior[i] = limSuperior[i-1] + 1;
+                limSuperior[i] = limSuperior[i-1] + arredonda;
+
+                MPI_Send(
+                    &limInferior[i],    //dado a enviar
+                    1,                  //quantidade de dados
+                    MPI_INT,            //tipo de dado
+                    i,                  //processo ou rank de destino
+                    i,                  //identificador(tag), em inteiro
+                    MPI_COMM_WORLD      //comunicador
+                );
+                MPI_Send(
+                    &limSuperior[i],    //dado a enviar
+                    1,                  //quantidade de dados
+                    MPI_INT,            //tipo de dado
+                    i,                  //processo ou rank de destino
+                    i,                  //identificador(tag), em inteiro
+                    MPI_COMM_WORLD      //comunicador
+                );
+            }
+        }
+    }
+    else { //demais threads
+        for (int i=1; i<numThreads; i++) {
+            if (threadAtual == i) {
+                MPI_Recv(
+                    &limInferior,           //dado a receber
+                    1,                      //quantidade de dados
+                    MPI_INT,                //tipo de dado
+                    0,                      //processo ou rank de origem
+                    threadAtual,            //identificador(tag), em inteiro
+                    MPI_COMM_WORLD,         //comunicador
+                    MPI_STATUS_IGNORE       //status
+                );
+                MPI_Recv(
+                    &limSuperior,           //dado a receber
+                    1,                      //quantidade de dados
+                    MPI_INT,                //tipo de dado
+                    0,                      //processo ou rank de origem
+                    i,                      //identificador(tag), em inteiro
+                    MPI_COMM_WORLD,         //comunicador
+                    MPI_STATUS_IGNORE       //status
+                );
+
+                func_mpi(limInferior, limSuperior);
+            }
+        }
+    }
+
+    for (int i=0; i<numThreads; i++)
+        MPI_Barrier(MPI_COMM_WORLD); //espera todos os processos finalizarem antes de terminar a contagem de tempo
+
+    if (threadAtual == 0) { //pode ser qualquer processo aqui, o importante é esperar todos eles finalizarem
+        clock_gettime(CLOCK_REALTIME, &end); //tempo de fim da execução do programa
+        vElapsedTime(); //chama função para calcular tempo de execução
+    }
+
+    MPI_Finalize();
+
+    return 0;
+
+#else
     if (argc > 1)
         numThreads = atoi(argv[1]); //número passado por parâmetro na execução do programa
     else {
         numThreads = 2;
         puts("Voce pode escolher o numero de threads pelo comando ./exec n");
     }
-
     printf("Executando a CNN para %d imagens ", nImagens);
     clock_gettime(CLOCK_REALTIME, &start); //tempo de início da execução do programa
-
+#endif
 
 #if defined(_OPENMP)        //OpenMP
+    if (numThreads == 0) //sem limite de threads
+        numThreads = omp_get_max_threads();
     printf("com OpenMP em %d threads\n", numThreads);
     imgFunc();
 #elif defined(_PTHREAD)   //PThreads
@@ -303,7 +409,6 @@ int main(int argc, char *argv[]) {
     for (int i=0; i<numThreads; i++) {
         pthread_join(threads[i], NULL); //esperando as threads terminarem a execução
     }
-
 #else                       //Nem OpenMP, nem Pthread, logo, é sequencial
     printf("de modo sequencial\n");
     imgFunc();
